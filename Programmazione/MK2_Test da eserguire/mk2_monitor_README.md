@@ -1,6 +1,8 @@
 # MK2 Monitor
 
-Nexus, Ball balancing robot
+Nexus, Ball balancing robot.
+
+*Nota:* il design dell'interfaccia grafica è stato progettato con l'Intelligenza artificiale seguendo le linee guida di design di Nexus. Il codice dell'interfaccia è stato scritto a mano, tranne la sezione dell'animazione 3d.
 
 `mk2_monitor.py` apre una finestra divisa a metà: a sinistra i dati (posizione della pallina, angoli dei servo, grafici), a destra il disegno 3D della piattaforma. Usa lo stesso PID e la stessa cinematica di `mk2_controller.py`.
 
