@@ -38,8 +38,19 @@ TOUCH_FILTER_ALPHA = 0.5
 KIN_H = 100.0
 KIN_E = 50.0
 KIN_B = 50.0
-KIN_F = 30.0
-KIN_G = 80.0
+KIN_F = 50.0
+KIN_G = 76.5
+
+# Robot reale (misure dal CAD). Il controllo usa KIN_*, la pallina simulata si muove con il piatto
+# inclinato dai servo secondo REALE_*: se KIN_* sono sbagliati, si vede.
+REALE_E = 50.0
+REALE_B = 50.0
+REALE_F = 50.0
+REALE_G = 76.5
+SERVO_VEL_DEG_S = 375.0
+RITARDO_S = 0.03        # touch + servo: tempo tra pallina che si muove e servo che reagisce
+ATTRITO = 0.05          # resistenza al rotolamento (1/s)
+BRACCIO_PALLINA_MM = 33.0  # centro pallina sopra l'asse di rotazione del piatto (+ effetto rotolamento)
 
 SERVO_AZIMUTH_DEG = (0.0, 120.0, 240.0)
 
@@ -176,7 +187,12 @@ class PallinaSimulata:
         self.x = random.uniform(-50, 50)
         self.y = random.uniform(-40, 40)
         self.vx = self.vy = 0.0
-        self.pitch = self.roll = 0.0
+        self.servo = [ANGOLO_HOME] * 3
+        self.coda = deque()
+        self.tempo = 0.0
+        self.vp = self.vr = 0.0
+        self.servo_obiettivo = [ANGOLO_HOME] * 3
+        self.pitch, self.roll, self.H = piatto_reale(self.servo, (0.0, 0.0, KIN_H))
         self.sul_piatto = True
         self.tempo_fuori = 0.0
 
@@ -185,8 +201,11 @@ class PallinaSimulata:
         self.vx += 200 * math.cos(angolo)
         self.vy += 200 * math.sin(angolo)
 
-    def aggiorna(self, pitch_deg, roll_deg, dt):
+    def aggiorna(self, angoli_comandati, dt):
         if not self.sul_piatto:
+            self.servo = list(angoli_comandati)
+            self.pitch, self.roll, self.H = piatto_reale(self.servo, (0.0, 0.0, KIN_H))
+            self.vp = self.vr = 0.0
             self.tempo_fuori += dt
             if self.tempo_fuori > 1.5:
                 self.reset()
@@ -195,13 +214,25 @@ class PallinaSimulata:
         passi = 10
         h = dt / passi
         for _ in range(passi):
-            k = min(1.0, h / 0.05)
-            self.pitch += (pitch_deg - self.pitch) * k
-            self.roll += (roll_deg - self.roll) * k
+            self.tempo += h
+            self.coda.append((self.tempo, list(angoli_comandati)))
+            obiettivo = self.servo_obiettivo
+            while self.coda and self.coda[0][0] <= self.tempo - RITARDO_S:
+                obiettivo = self.coda.popleft()[1]
+            self.servo_obiettivo = obiettivo
+            passo = SERVO_VEL_DEG_S * h
+            self.servo = [s + max(-passo, min(passo, c - s)) for s, c in zip(self.servo, obiettivo)]
+            p0, r0 = self.pitch, self.roll
+            self.pitch, self.roll, self.H = piatto_reale(self.servo, (self.pitch, self.roll, self.H))
+            vp = math.radians(self.pitch - p0) / h
+            vr = math.radians(self.roll - r0) / h
+            acc_p, acc_r = (vp - self.vp) / h, (vr - self.vr) / h
+            self.vp, self.vr = vp, vr
 
             g = 5.0 / 7.0 * 9810.0
-            ax = g * math.sin(math.radians(self.pitch)) - 0.25 * self.vx
-            ay = g * math.sin(math.radians(self.roll)) - 0.25 * self.vy
+            k = 5.0 / 7.0 * BRACCIO_PALLINA_MM
+            ax = g * math.sin(math.radians(self.pitch)) - k * acc_p - ATTRITO * self.vx
+            ay = g * math.sin(math.radians(self.roll)) - k * acc_r - ATTRITO * self.vy
             self.vx += ax * h
             self.vy += ay * h
             self.x += self.vx * h
@@ -308,19 +339,55 @@ def calcola_angoli_servo(pitch_deg, roll_deg, angoli_precedenti):
         angoli.append(max(SERVO_MIN_DEG, min(SERVO_MAX_DEG, angolo)))
     return angoli
 
-def punto_sul_piatto(R, x, y, z=0.0):
+def punto_sul_piatto(R, x, y, z=0.0, H=KIN_H):
     return (R[0][0] * x + R[0][1] * y + R[0][2] * z,
             R[1][0] * x + R[1][1] * y + R[1][2] * z,
-            R[2][0] * x + R[2][1] * y + R[2][2] * z + KIN_H)
+            R[2][0] * x + R[2][1] * y + R[2][2] * z + H)
 
-def punti_gamba(R, indice, angolo_servo):
+def punti_gamba(R, indice, angolo_servo, H=KIN_H, B=KIN_B, F=KIN_F, E=KIN_E):
     b = math.radians(SERVO_AZIMUTH_DEG[indice])
     ux, uy = math.cos(b), math.sin(b)
-    S = (KIN_B * ux, KIN_B * uy, 0.0)
+    S = (B * ux, B * uy, 0.0)
     a = math.radians(180.0 - angolo_servo)
-    K = (S[0] + KIN_F * math.cos(a) * ux, S[1] + KIN_F * math.cos(a) * uy, KIN_F * math.sin(a))
-    P = punto_sul_piatto(R, KIN_E * ux, KIN_E * uy)
+    K = (S[0] + F * math.cos(a) * ux, S[1] + F * math.cos(a) * uy, F * math.sin(a))
+    P = punto_sul_piatto(R, E * ux, E * uy, 0.0, H)
     return S, K, P
+
+def _residui(pitch, roll, H, angoli):
+    R = _matrice_rotazione(math.radians(pitch), math.radians(roll))
+    out = []
+    for i in range(3):
+        S, K, P = punti_gamba(R, i, angoli[i], H, REALE_B, REALE_F, REALE_E)
+        out.append(sum((p - k) ** 2 for p, k in zip(P, K)) - REALE_G ** 2)
+    return out
+
+def piatto_reale(angoli, stima):
+    # Cinematica diretta: dagli angoli dei servo all'inclinazione vera del piatto (pitch, roll, H)
+    v = list(stima)
+    for _ in range(8):
+        f = _residui(*v, angoli)
+        if max(abs(x) for x in f) < 1e-6:
+            break
+        J = []
+        for j in range(3):
+            w = list(v)
+            w[j] += 1e-4
+            fj = _residui(*w, angoli)
+            J.append([(fj[i] - f[i]) / 1e-4 for i in range(3)])
+        A = [[J[c][r] for c in range(3)] + [-f[r]] for r in range(3)]
+        for c in range(3):
+            piv = max(range(c, 3), key=lambda r: abs(A[r][c]))
+            if abs(A[piv][c]) < 1e-12:
+                return stima
+            A[c], A[piv] = A[piv], A[c]
+            for r in range(3):
+                if r != c:
+                    k = A[r][c] / A[c][c]
+                    A[r] = [a - k * b for a, b in zip(A[r], A[c])]
+        v = [v[i] + A[i][3] / A[i][i] for i in range(3)]
+    if abs(v[0]) > 45 or abs(v[1]) > 45:
+        return stima
+    return tuple(v)
 
 def punto_percorso(nome, t):
     if nome == "cerchio":
@@ -553,7 +620,7 @@ class App:
                         x, y, toccato = self.touch.leggi_posizione()
                         angoli = self.ctrl.step(x, y, toccato)
                         if isinstance(self.touch, PallinaSimulata):
-                            self.touch.aggiorna(self.ctrl.pitch, self.ctrl.roll, dt)
+                            self.touch.aggiorna(angoli, dt)
                         self.uscita.muovi(angoli)
                     except Exception as e:
                         self.errore = str(e)
@@ -567,13 +634,18 @@ class App:
                 prossimo = time.monotonic()
 
     def istantanea(self):
-        return {
+        d = {
             "pitch": self.ctrl.pitch,
             "roll": self.ctrl.roll,
             "filt_x": self.ctrl.filt_x,
             "filt_y": self.ctrl.filt_y,
             "angoli": list(self.uscita.angoli),
+            "reale": None,
         }
+        if isinstance(self.touch, PallinaSimulata):
+            t = self.touch
+            d["reale"] = (t.pitch, t.roll, t.H, list(t.servo))
+        return d
 
     def disegna(self):
         with self.blocco:
@@ -604,8 +676,12 @@ class App:
 
     def aggiorna_numeri(self):
         d = self.ist
-        self.valori["pitch"].config(text=f"{d['pitch']:+5.1f}°")
-        self.valori["roll"].config(text=f"{d['roll']:+5.1f}°")
+        if d["reale"]:
+            self.valori["pitch"].config(text=f"{d['pitch']:+4.1f}→{d['reale'][0]:+4.1f}°")
+            self.valori["roll"].config(text=f"{d['roll']:+4.1f}→{d['reale'][1]:+4.1f}°")
+        else:
+            self.valori["pitch"].config(text=f"{d['pitch']:+5.1f}°")
+            self.valori["roll"].config(text=f"{d['roll']:+5.1f}°")
         if d["filt_x"] is None:
             self.valori["x"].config(text="--")
             self.valori["y"].config(text="--")
@@ -792,15 +868,20 @@ class App:
         self.cx, self.cy = larg / 2, alt / 2 + KIN_H * 0.4 * self.scala3d
 
         d = self.ist
-        R = _matrice_rotazione(math.radians(d["pitch"]), math.radians(d["roll"]))
-        angoli = d["angoli"]
+        if d["reale"]:
+            pitch, roll, H, angoli = d["reale"]
+            geo = dict(H=H, B=REALE_B, F=REALE_F, E=REALE_E)
+        else:
+            pitch, roll, H, angoli = d["pitch"], d["roll"], KIN_H, d["angoli"]
+            geo = {}
+        R = _matrice_rotazione(math.radians(pitch), math.radians(roll))
 
         raggio_base = KIN_B + 40
         cerchio = [(raggio_base * math.cos(k * math.pi / 24), raggio_base * math.sin(k * math.pi / 24), -15)
                    for k in range(48)]
         self.poligono(cerchio, fill="#18213f", outline=GRIGLIA, width=2)
 
-        gambe = [punti_gamba(R, i, angoli[i]) for i in range(3)]
+        gambe = [punti_gamba(R, i, angoli[i], **geo) for i in range(3)]
         ordine = sorted(range(3), key=lambda i: -self.profondita(gambe[i][0]))
         for i in ordine:
             S, K, P = gambe[i]
@@ -817,23 +898,23 @@ class App:
 
         mx, my = TOUCH_DIM_Y_MM / 2, TOUCH_DIM_X_MM / 2
         for gx in range(-80, 81, 20):
-            c.create_line(*self.proietta(punto_sul_piatto(R, gx, -my)),
-                          *self.proietta(punto_sul_piatto(R, gx, my)), fill=GRIGLIA)
+            c.create_line(*self.proietta(punto_sul_piatto(R, gx, -my, 0.0, H)),
+                          *self.proietta(punto_sul_piatto(R, gx, my, 0.0, H)), fill=GRIGLIA)
         for gy in range(-60, 61, 20):
-            c.create_line(*self.proietta(punto_sul_piatto(R, -mx, gy)),
-                          *self.proietta(punto_sul_piatto(R, mx, gy)), fill=GRIGLIA)
-        bordo = [punto_sul_piatto(R, x, y) for x, y in ((-mx, -my), (mx, -my), (mx, my), (-mx, my))]
+            c.create_line(*self.proietta(punto_sul_piatto(R, -mx, gy, 0.0, H)),
+                          *self.proietta(punto_sul_piatto(R, mx, gy, 0.0, H)), fill=GRIGLIA)
+        bordo = [punto_sul_piatto(R, x, y, 0.0, H) for x, y in ((-mx, -my), (mx, -my), (mx, my), (-mx, my))]
         self.poligono(bordo, fill="", outline=CIANO, width=2)
 
         if self.percorso != "centro":
             linea = []
             for k in range(121):
                 px, py = punto_percorso(self.percorso, PERIODI[self.percorso] * k / 120)
-                linea += self.proietta(punto_sul_piatto(R, -px, -py))
+                linea += self.proietta(punto_sul_piatto(R, -px, -py, 0.0, H))
             c.create_line(*linea, fill=PERCORSO, width=2)
 
         if d["filt_x"] is not None:
-            centro_pallina = punto_sul_piatto(R, -d["filt_x"], -d["filt_y"], 20)
+            centro_pallina = punto_sul_piatto(R, -d["filt_x"], -d["filt_y"], 20, H)
             x, y = self.proietta(centro_pallina)
             r = 20 * self.scala3d
             c.create_oval(x - r, y - r, x + r, y + r, fill=PALLINA, outline="")
@@ -844,7 +925,7 @@ class App:
             x, y = self.proietta(((raggio_base + 25) * math.cos(b), (raggio_base + 25) * math.sin(b), -15))
             c.create_text(x, y, text=f"{'ABC'[i]}  {angoli[i]:5.1f}°", fill=TESTO, font=("Menlo", 13, "bold"))
 
-        c.create_text(14, 12, anchor="nw", text="Piattaforma 3D (trascina per ruotare)",
+        c.create_text(14, 12, anchor="nw", text="Piattaforma 3D, inclinazione vera dai servo (trascina per ruotare)",
                       fill=TENUE, font=("Helvetica", 12))
 
     def avvia_pausa(self):
